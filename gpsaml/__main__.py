@@ -9,8 +9,8 @@
 
 import base64
 from bs4 import BeautifulSoup
-from fido2.hid import CtapHidDevice
 from fido2.client import Fido2Client
+from fido2.hid import CtapHidDevice
 from fido2.utils import websafe_decode, websafe_encode
 from fido2.webauthn import PublicKeyCredentialDescriptor as PKCD
 from fido2.webauthn import PublicKeyCredentialRequestOptions as PKCRO
