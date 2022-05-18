@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
-# Based partly on information from Peter Williams [1] and partly on manual
-# tracing of Duo Web authentication flow.
+# Based partly on information from Peter Williams [1], partly on manual tracing
+# of Duo Web authentication flow with HTTP logging and Wireshark usbmon
+# captures.
 #
 # [1]: https://github.com/pkgw/bibtools/blob/master/harvard-duo-auth-flow.md
 #
-# It is possible that there may be skippable steps here, but this does work.
+# It is possible that there may be skippable steps here, but this works for
+# both Duo Push and WebAuthn (tested with GoTrust Idem Key).
 
 import base64
 from bs4 import BeautifulSoup
@@ -34,7 +36,8 @@ class Fido2Impl:
         dev = next(CtapHidDevice.list_devices(), None)
         return dev is not None
 
-    def get_signature(self, appid: str, key: PKCD, clientData: dict[str, Any]) -> tuple[str, str, str]:
+    def get_signature(self, appid: str, keyid_b64: str, clientData: dict[str, Any]) -> tuple[str, str, str]:
+        key = PKCD(type="public-key", id=websafe_decode(keyid_b64))
         result = self.client.get_assertion(PKCRO(
             challenge=websafe_decode(clientData["challenge"]),
             rp_id=appid,
@@ -47,9 +50,6 @@ class Fido2Impl:
             result.signature.hex(),
             websafe_encode(result.client_data),
         )
-
-    def key_for_id(self, keyid_b64: str) -> PKCD:
-        return PKCD(type="public-key", id=websafe_decode(keyid_b64))
 
 
 def main():
@@ -179,8 +179,7 @@ def main():
 
         # Set up key
         impl = Fido2Impl(origin)
-        key = impl.key_for_id(cred["id"])
-        authenticatorData_b64, sig_hex, clientDataJSON_b64 = impl.get_signature(appid, key, clientData)
+        authenticatorData_b64, sig_hex, clientDataJSON_b64 = impl.get_signature(appid, cred["id"], clientData)
 
         # Submit response from hardware token
         response_data = {
