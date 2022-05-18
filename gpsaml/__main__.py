@@ -19,37 +19,8 @@ from fido2.webauthn import PublicKeyCredentialRequestOptions as PKCRO
 import json
 import requests
 import sys
-from typing import Any
 import urllib.parse
 import xml.etree.ElementTree as ET
-
-
-class Fido2Impl:
-    def __init__(self, origin: str):
-        dev = next(CtapHidDevice.list_devices(), None)
-        assert(dev is not None)
-
-        self.client = Fido2Client(dev, origin)
-
-    @staticmethod
-    def device_present() -> bool:
-        dev = next(CtapHidDevice.list_devices(), None)
-        return dev is not None
-
-    def get_signature(self, appid: str, keyid_b64: str, clientData: dict[str, Any]) -> tuple[str, str, str]:
-        key = PKCD(type="public-key", id=websafe_decode(keyid_b64))
-        result = self.client.get_assertion(PKCRO(
-            challenge=websafe_decode(clientData["challenge"]),
-            rp_id=appid,
-            allow_credentials=[key],
-            extensions=clientData["clientExtensions"],
-        )).get_response(0)
-
-        return (
-            websafe_encode(result.authenticator_data),
-            result.signature.hex(),
-            websafe_encode(result.client_data),
-        )
 
 
 def main():
@@ -64,7 +35,7 @@ def main():
 
     # First retrieve SAML from VPN host
     url = f"https://{host}/ssl-vpn/prelogin.esp"
-    #url = f"https://{host}/global-protect/prelogin.esp"
+    # url = f"https://{host}/global-protect/prelogin.esp"
     r = http.get(url)
     if r.status_code != 200:
         print("Failed to make prelogin request", file=sys.stderr)
@@ -89,7 +60,7 @@ def main():
 
     # Fill in next form with username/password
     form = soup.find("form")
-    inputs = {e["name"]: e.get("value", None) for e in form("input")}
+    inputs = {e["name"]: e.get("value") for e in form("input")}
     inputs["j_username"] = username
     inputs["j_password"] = password
 
@@ -106,13 +77,13 @@ def main():
     duohost = iframe["data-host"]
     duo_sig, app_sig = iframe["data-sig-request"].split(":")
     post_act = urllib.parse.urljoin(auth.url, iframe["data-post-action"])
-    # Currently doesn't appear to be used in our case
-    #post_arg = iframe.get("data-post-argument")
 
     # Send API request (yes, this is actually a POST with a query string) and
     # parse response
     urienc = urllib.parse.quote(auth_url)
-    iframe_url = f"https://{duohost}/frame/web/v1/auth?tx={duo_sig}&parent={urienc}&v=2.6"
+    iframe_url = (
+        f"https://{duohost}/frame/web/v1/auth?tx={duo_sig}&parent={urienc}&v=2.6"
+    )
 
     iframe = http.post(iframe_url)
     if iframe.status_code != 200:
@@ -120,24 +91,34 @@ def main():
         exit(1)
     soup = BeautifulSoup(iframe.text, "html.parser")
 
-    # Get SID from response and select second factor
+    # Get SID from response
     form = soup.find("form")
-    sid = form.find("input", attrs={"name": "sid"}).get("value")
-    inputs = {"sid": sid}
+    sid = form.find("input", {"name": "sid"}).get("value")
 
-    # Check for hardware key
-    use_hardware_key = Fido2Impl.device_present()
+    # Default to push
+    factor = "Duo Push"
+    device = "phone1"
 
-    if use_hardware_key:
-        inputs["factor"] = "WebAuthn Credential"
-        inputs["device"] = form.find("option", {"name": "webauthn"})["value"]
-    else:
-        inputs["factor"] = "Duo Push"
-        inputs["device"] = "phone1"
+    # Check for hardware key and autoselect second factor
+    keydev = next(CtapHidDevice.list_devices(), None)
+    if keydev is not None:
+        key_elt = form.find("option", {"name": "webauthn"})
+        if key_elt:
+            factor = "WebAuthn Credential"
+            device = key_elt["value"]
+        else:
+            keydev = None
 
     # Submit second-factor form
     prompt_url = urllib.parse.urljoin(iframe.url, form["action"])
-    prompt = http.post(prompt_url, data=inputs)
+    prompt = http.post(
+        prompt_url,
+        data={
+            "sid": sid,
+            "factor": factor,
+            "device": device,
+        },
+    )
     if prompt.status_code != 200:
         print("Failed to load prompt", file=sys.stderr)
         exit(1)
@@ -145,66 +126,77 @@ def main():
 
     # First POST to /frame/status issues the challenge/push
     status_url = urllib.parse.urljoin(prompt.url, "/frame/status")
-    challenge_req = http.post(status_url, data={
-        "sid": sid,
-        "txid": txid,
-    })
+    challenge_req = http.post(
+        status_url,
+        data={
+            "sid": sid,
+            "txid": txid,
+        },
+    )
     if challenge_req.status_code != 200:
         print(f"Failed to get status {challenge_req.status_code}", file=sys.stderr)
         exit(1)
 
-    if use_hardware_key:
+    if keydev is not None:
+        # Retrieve challenge from server reply
         challengedata = challenge_req.json()["response"]
         if challengedata["status_code"] != "webauthn_sent":
-            print(f"Failed to get challenge {challengedata['status_code']}", file=sys.stderr)
+            print(
+                f"Failed to get challenge {challengedata['status_code']}",
+                file=sys.stderr,
+            )
             exit(1)
-
-        options = challengedata["webauthn_credential_request_options"]
 
         scheme, netloc, _, _, _, _ = urllib.parse.urlparse(prompt.url)
         origin = f"{scheme}://{netloc}"
+
+        options = challengedata["webauthn_credential_request_options"]
         # TODO: would there ever be an index 1 or higher?
         cred = options["allowCredentials"][0]
-        challenge = options["challenge"]
-        appid = options['rpId']
 
-        clientData = {
-            "challenge": challenge,
-            "clientExtensions": options["extensions"],
-            "hashAlgorithm": "SHA-256",
-            "origin": origin,
-            "type": "webauthn.get",
-        }
+        # Set up FIDO2 key
+        hwkey = Fido2Client(keydev, origin)
+        result = hwkey.get_assertion(
+            PKCRO(
+                challenge=websafe_decode(options["challenge"]),
+                rp_id=options["rpId"],
+                allow_credentials=[
+                    PKCD(
+                        type=cred["type"],
+                        id=websafe_decode(cred["id"]),
+                    )
+                ],
+                extensions=options["extensions"],
+            )
+        ).get_response(0)
 
-
-        # Set up key
-        impl = Fido2Impl(origin)
-        authenticatorData_b64, sig_hex, clientDataJSON_b64 = impl.get_signature(appid, cred["id"], clientData)
-
-        # Submit response from hardware token
+        # Gather data from FIDO2 key
         response_data = {
             "sessionId": options["sessionId"],
             "id": cred["id"],
             "rawId": cred["id"],
             "type": cred["type"],
-            "authenticatorData": authenticatorData_b64,
-            "clientDataJSON": clientDataJSON_b64,
-            "signature": sig_hex,
+            "authenticatorData": websafe_encode(result.authenticator_data),
+            "clientDataJSON": websafe_encode(result.client_data),
+            "signature": result.signature.hex(),
             "extensionResults": {
                 "appid": False,
             },
         }
 
-        # Provide assertion from U2F key (12)
-        auth = http.post(prompt_url, data={
-            "sid": sid,
-            "device": "webauthn_credential",
-            "factor": "webauthn_finish",
-            "response_data": json.dumps(response_data, separators=(',', ':')),
-            "out_of_date": "False",
-            "days_out_of_date": "0",
-            "days_to_block": "None",
-        })
+        # Submit two-factor response
+        auth = http.post(
+            prompt_url,
+            data={
+                "sid": sid,
+                "device": "webauthn_credential",
+                "factor": "webauthn_finish",
+                "response_data": json.dumps(response_data, separators=(",", ":")),
+                "out_of_date": "False",
+                "days_out_of_date": "0",
+                "days_to_block": "None",
+            },
+        )
         if auth.status_code != 200:
             print("Failed to load auth", file=sys.stderr)
             exit(1)
@@ -213,10 +205,13 @@ def main():
         txid = auth.json()["response"]["txid"]
 
     # Second POST to /frame/status gets the 2FA response
-    result_req = http.post(status_url, data={
-        "sid": sid,
-        "txid": txid,
-    })
+    result_req = http.post(
+        status_url,
+        data={
+            "sid": sid,
+            "txid": txid,
+        },
+    )
     if result_req.status_code != 200:
         print(f"Failed to get result {result_req.status_code}", file=sys.stderr)
         exit(1)
@@ -237,14 +232,20 @@ def main():
     signed_duo_response = f"{finaldata['cookie']}:{app_sig}"
 
     # POST Duo signature back to original form
-    final = http.post(post_act, {"_eventId": "proceed", "sig_response": signed_duo_response})
+    final = http.post(
+        post_act,
+        data={
+            "_eventId": "proceed",
+            "sig_response": signed_duo_response,
+        },
+    )
     if final.status_code != 200:
         print(f"Failed to get final {final.status_code}", file=sys.stderr)
         exit(1)
 
     soup = BeautifulSoup(final.text, "html.parser")
     form = soup.find("form")
-    inputs = {e["name"]: e.get("value", None) for e in form("input") if e.get("name") is not None}
+    inputs = {e["name"]: e["value"] for e in form("input") if e.get("name") is not None}
 
     # POST again to get prelogin cookie for GlobalProtect
     veryfinal_url = urllib.parse.urljoin(final.url, form["action"])
@@ -252,7 +253,7 @@ def main():
     if veryfinal.status_code != 200:
         print(f"Failed to get veryfinal {veryfinal.status_code}", file=sys.stderr)
         exit(1)
-    cookie = veryfinal.headers['prelogin-cookie']
+    cookie = veryfinal.headers["prelogin-cookie"]
 
     # Print authorization cookie to stdout for use with
     #     openconnect --usergroup=gateway:prelogin-cookie --passwd-on-stdin
