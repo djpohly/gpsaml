@@ -9,10 +9,17 @@
 
 import base64
 from bs4 import BeautifulSoup
+import html
+import json
 import requests
 import sys
 import urllib.parse
 import xml.etree.ElementTree as ET
+
+from .impl import Fido2Impl
+
+
+USE_HARDWARE_KEY = True
 
 
 def main():
@@ -34,7 +41,7 @@ def main():
         exit(1)
 
     # Parse HTML page out of SAML request
-    saml = ET.fromstring(r.content)
+    saml = ET.fromstring(r.text)
     req = base64.b64decode(saml.find("saml-request").text)
     soup = BeautifulSoup(req, "html.parser")
 
@@ -48,7 +55,7 @@ def main():
     if login.status_code != 200:
         print("Failed to request login page", file=sys.stderr)
         exit(1)
-    soup = BeautifulSoup(login.content, "html.parser")
+    soup = BeautifulSoup(login.text, "html.parser")
 
     # Fill in next form with username/password
     form = soup.find("form")
@@ -62,11 +69,11 @@ def main():
     if auth.status_code != 200:
         print("Failed to authenticate step 1", file=sys.stderr)
         exit(1)
-    soup = BeautifulSoup(auth.content, "html.parser")
+    soup = BeautifulSoup(auth.text, "html.parser")
 
     # Pull information needed to construct API request from iframe tag
     iframe = soup.find("iframe", id="duo_iframe")
-    host = iframe["data-host"]
+    duohost = iframe["data-host"]
     duo_sig, app_sig = iframe["data-sig-request"].split(":")
     post_act = urllib.parse.urljoin(auth.url, iframe["data-post-action"])
     # Currently doesn't appear to be used in our case
@@ -75,37 +82,26 @@ def main():
     # Send API request (yes, this is actually a POST with a query string) and
     # parse response
     urienc = urllib.parse.quote(auth_url)
-    iframe_url = f"https://{host}/frame/web/v1/auth?tx={duo_sig}&parent={urienc}&v=2.6"
+    iframe_url = f"https://{duohost}/frame/web/v1/auth?tx={duo_sig}&parent={urienc}&v=2.6"
+
     iframe = http.post(iframe_url)
     if iframe.status_code != 200:
         print("Failed to load Duo frame", file=sys.stderr)
         exit(1)
-    soup = BeautifulSoup(iframe.content, "html.parser")
+    soup = BeautifulSoup(iframe.text, "html.parser")
 
-    # Select second factor
+    # Get SID from response and select second factor
     form = soup.find("form")
-    print(form, file=sys.stderr)
-    inputs = {e["name"]: e.get("value", None) for e in form("input")}
-    # Hard-coded since scraping select/option elements is not as easy
-    if False:
+    sid = form.find("input", attrs={"name": "sid"}).get("value")
+    inputs = {"sid": sid}
+
+    if USE_HARDWARE_KEY:
+        # TODO: check automatically for key presence
         inputs["factor"] = "WebAuthn Credential"
-        inputs["auth_device_label"] = "Security Key"
-        # GET https://api-445a7321.duosecurity.com/frame/prompt/webauthn_auth_popup
-        #    ?sid=MTczZThkZmZmMThiNGQ0NmE2ZGViMGFiNWIxNGRjMDA%3D%7C209.147.96.13%7C1642631457%7C63bd486294666027428369627e14ea5b0f66ca0c
-        #    &wkey=WAGZIZX4J1NUZRVYIMYN
-        # <script ... id="page_data">{"wkey": "WAGZIZX4J1NUZRVYIMYN"}</script>
-        # <script ... id="sid">"MTczZThkZmZmMThiNGQ0NmE2ZGViMGFiNWIxNGRjMDA=|209.147.96.13|1642631463|6fcebc102a5dcc0388308cab5262fd0463f0d5ac"</script>
-        # POST /frame/prompt
-        #    sid=MTczZThkZmZmMThiNGQ0NmE2ZGViMGFiNWIxNGRjMDA=|209.147.96.13|1642631463|6fcebc102a5dcc0388308cab5262fd0463f0d5ac
-        #    device=WAGZIZX4J1NUZRVYIMYN
-        #    factor=WebAuthn+Credential
-        # POST /frame/status
-        #    sid=MTczZThkZmZmMThiNGQ0NmE2ZGViMGFiNWIxNGRjMDA=|209.147.96.13|1642631463|6fcebc102a5dcc0388308cab5262fd0463f0d5ac
-        #    txid=0ade83f3-e5fe-4267-853a-2a9bef9dc194
+        inputs["device"] = form.find("option", {"name": "webauthn"})["value"]
     else:
         inputs["factor"] = "Duo Push"
         inputs["device"] = "phone1"
-    sid = inputs["sid"]
 
     # Submit second-factor form
     prompt_url = urllib.parse.urljoin(iframe.url, form["action"])
@@ -115,26 +111,99 @@ def main():
         exit(1)
     txid = prompt.json()["response"]["txid"]
 
-    # First POST to /frame/status initiates the push
+    # First POST to /frame/status issues the challenge/push
     status_url = urllib.parse.urljoin(prompt.url, "/frame/status")
-    status = http.post(status_url, {"sid": sid, "txid": txid})
-    if status.status_code != 200:
-        print(f"Failed to get status {status.status_code}", file=sys.stderr)
+    challenge_req = http.post(status_url, data={
+        "sid": sid,
+        "txid": txid,
+    })
+    if challenge_req.status_code != 200:
+        print(f"Failed to get status {challenge_req.status_code}", file=sys.stderr)
         exit(1)
-    # Second, identical POST to /frame/status waits for response
-    status = http.post(status_url, {"sid": sid, "txid": txid})
-    if status.status_code != 200:
-        print(f"Failed to get status2 {status.status_code}", file=sys.stderr)
+
+    if USE_HARDWARE_KEY:
+        challengedata = challenge_req.json()["response"]
+        if challengedata["status_code"] != "webauthn_sent":
+            print(f"Failed to get challenge {challengedata['status_code']}", file=sys.stderr)
+            exit(1)
+
+        options = challengedata["webauthn_credential_request_options"]
+
+        scheme, netloc, _, _, _, _ = urllib.parse.urlparse(prompt.url)
+        origin = f"{scheme}://{netloc}"
+        # TODO: would there ever be an index 1 or higher?
+        cred = options["allowCredentials"][0]
+        challenge = options["challenge"]
+        appid = options['rpId']
+
+        clientData = {
+            "challenge": challenge,
+            "clientExtensions": options["extensions"],
+            "hashAlgorithm": "SHA-256",
+            "origin": origin,
+            "type": "webauthn.get",
+        }
+
+
+        # Set up key
+        impl = Fido2Impl(origin)
+        key = impl.key_for_id(cred["id"])
+        authenticatorData_b64, sig_hex, clientDataJSON_b64 = impl.get_signature(appid, key, clientData)
+
+        # Submit response from hardware token
+        response_data = {
+            "sessionId": options["sessionId"],
+            "id": cred["id"],
+            "rawId": cred["id"],
+            "type": cred["type"],
+            "authenticatorData": authenticatorData_b64,
+            "clientDataJSON": clientDataJSON_b64,
+            "signature": sig_hex,
+            "extensionResults": {
+                "appid": False,
+            },
+        }
+
+        # Provide assertion from U2F key (12)
+        auth = http.post(prompt_url, data={
+            "sid": sid,
+            "device": "webauthn_credential",
+            "factor": "webauthn_finish",
+            "response_data": json.dumps(response_data, separators=(',', ':')),
+            "out_of_date": "False",
+            "days_out_of_date": "0",
+            "days_to_block": "None",
+        })
+        if auth.status_code != 200:
+            print("Failed to load auth", file=sys.stderr)
+            exit(1)
+
+        # New txid is issued for hardware key authentication
+        txid = auth.json()["response"]["txid"]
+
+    # Second POST to /frame/status gets the 2FA response
+    result_req = http.post(status_url, data={
+        "sid": sid,
+        "txid": txid,
+    })
+    if result_req.status_code != 200:
+        print(f"Failed to get result {result_req.status_code}", file=sys.stderr)
         exit(1)
 
     # Duo cookie is provided in response JSON
-    result_url = urllib.parse.urljoin(prompt.url, status.json()["response"]["result_url"])
-    result = http.post(result_url, {"sid": sid, "txid": txid})
-    if result.status_code != 200:
-        print(f"Failed to get result {result.status_code}", file=sys.stderr)
+    resultdata = result_req.json()["response"]
+    if resultdata["result"] != "SUCCESS":
+        print(f"Failed to get result {resultdata['result']}", file=sys.stderr)
         exit(1)
-    js = result.json()["response"]
-    signed_duo_response = f"{js['cookie']}:{app_sig}"
+
+    finalurl = urllib.parse.urljoin(iframe.url, resultdata["result_url"])
+    final_req = http.post(finalurl, data={"sid": sid})
+    if final_req.status_code != 200:
+        print(f"Failed to get final {final_req.status_code}", file=sys.stderr)
+        exit(1)
+
+    finaldata = final_req.json()["response"]
+    signed_duo_response = f"{finaldata['cookie']}:{app_sig}"
 
     # POST Duo signature back to original form
     final = http.post(post_act, {"_eventId": "proceed", "sig_response": signed_duo_response})
@@ -142,7 +211,7 @@ def main():
         print(f"Failed to get final {final.status_code}", file=sys.stderr)
         exit(1)
 
-    soup = BeautifulSoup(final.content, "html.parser")
+    soup = BeautifulSoup(final.text, "html.parser")
     form = soup.find("form")
     inputs = {e["name"]: e.get("value", None) for e in form("input") if e.get("name") is not None}
 
