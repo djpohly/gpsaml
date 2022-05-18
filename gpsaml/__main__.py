@@ -9,7 +9,6 @@
 
 import base64
 from bs4 import BeautifulSoup
-import html
 import json
 import requests
 import sys
@@ -17,9 +16,6 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 from .impl import Fido2Impl
-
-
-USE_HARDWARE_KEY = True
 
 
 def main():
@@ -95,8 +91,10 @@ def main():
     sid = form.find("input", attrs={"name": "sid"}).get("value")
     inputs = {"sid": sid}
 
-    if USE_HARDWARE_KEY:
-        # TODO: check automatically for key presence
+    # Check for hardware key
+    use_hardware_key = Fido2Impl.device_present()
+
+    if use_hardware_key:
         inputs["factor"] = "WebAuthn Credential"
         inputs["device"] = form.find("option", {"name": "webauthn"})["value"]
     else:
@@ -121,7 +119,7 @@ def main():
         print(f"Failed to get status {challenge_req.status_code}", file=sys.stderr)
         exit(1)
 
-    if USE_HARDWARE_KEY:
+    if use_hardware_key:
         challengedata = challenge_req.json()["response"]
         if challengedata["status_code"] != "webauthn_sent":
             print(f"Failed to get challenge {challengedata['status_code']}", file=sys.stderr)

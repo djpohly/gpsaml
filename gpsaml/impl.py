@@ -14,6 +14,11 @@ class Fido2Impl:
 
         self.client = Fido2Client(dev, origin)
 
+    @staticmethod
+    def device_present():
+        dev = next(CtapHidDevice.list_devices(), None)
+        return dev is not None
+
     def get_signature(self, appid, key: PKCD, clientData):
         result = self.client.get_assertion(PKCRO(
             challenge=websafe_decode(clientData["challenge"]),
